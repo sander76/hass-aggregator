@@ -61,7 +61,7 @@ def async_setup(hass, config):
 
 class BaseAggrFunction():
     def __init__(self, name, range=None):
-        self.state = None
+        self._temp_state = None
         self._name = name
         self._attributes = {"method": name}
         if range:
@@ -102,15 +102,15 @@ class AggrMax(BaseAggrFunction):
         BaseAggrFunction.__init__(self, 'max', range=aggregator.get('range'))
 
     def _check_max(self, new_val):
-        if self.state is None:
-            self.state = new_val
+        if self._temp_state is None:
+            self._temp_state = new_val
         else:
-            self.state = max(self.state, new_val)
+            self._temp_state = max(self._temp_state, new_val)
 
     def aggregate(self, state):
         self._check_max(state)
         if self._check_range():
-            return self.state
+            return self._temp_state
         else:
             return None
 
@@ -120,15 +120,15 @@ class AggrMin(BaseAggrFunction):
         BaseAggrFunction.__init__(self, 'min', range=aggregator.get('range'))
 
     def _check_min(self, new_val):
-        if self.state is None:
-            self.state = new_val
+        if self._temp_state is None:
+            self._temp_state = new_val
         else:
-            self.state = min(self.state, new_val)
+            self._temp_state = min(self._temp_state, new_val)
 
     def aggregate(self, state):
         self._check_min(state)
         if self._check_range():
-            return self.state
+            return self._temp_state
         else:
             return None
 
@@ -137,6 +137,10 @@ def get_aggregator(aggregator: dict) -> BaseAggrFunction:
     _method = aggregator.get('method')
     if _method == 'skip':
         return AggrSkip(aggregator)
+    elif _method == 'max':
+        return AggrMax(aggregator)
+    elif _method == 'min':
+        return AggrMin(aggregator)
 
 
 class AggregatedEntity(Entity):
