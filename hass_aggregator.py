@@ -10,8 +10,14 @@ hass-aggregator:
         range: 4
     - entity_id: <an id>
       aggregator:
-        method: maxevery
-        cycle: 10 minutes
+        cycle:
+          cycle: time
+          range: 10 #minutes
+        methods:
+          - max
+          - min
+          - average
+          cycle: 10 minutes
     - entity_id: <an id>
       aggregator:
         method: cap
@@ -27,6 +33,11 @@ cap
 sum
 sun # special case with capping and skipping.
 """
+
+CONF_CYCLE = 'cycle'
+CONF_CYCLE_TIME = 'time'
+CONF_CYCLE_RANGE = 'range'
+
 
 import asyncio
 import logging
@@ -45,13 +56,14 @@ ENTITY_ID_FORMAT = DOMAIN + '.{}'
 
 _LOGGER = logging.getLogger(__name__)
 
-CONF_METHOD = 'method'
+ATTR_AGGREGATOR = 'aggregator'
+ATTR_METHOD = 'method'
 CONF_METHOD_EVERY = 'every'
 CONF_METHOD_MAX = 'max'
 CONF_METHOD_MIN = 'min'
 CONF_METHOD_SKIP = 'skip'
 CONF_METHOD_MAX_EVERY = 'maxevery'
-CONF_CYCLE = 'cycle'
+ATTR_CYCLE = 'cycle'
 CONF_RANGE = 'range'
 
 
@@ -65,9 +77,8 @@ def async_setup(hass, config):
     @callback
     def aggregate(_event):
         # new_state = _event.data.get('new_state')
-        if _event.event_type == EVENT_STATE_CHANGED or _event.event_type == EVENT_TIME_CHANGED:
-            for entity in entities:
-                entity.aggregate(_event)
+        for entity in entities:
+            entity.aggregate(_event)
 
     hass.bus.async_listen(
         EVENT_STATE_CHANGED,
@@ -86,15 +97,15 @@ class BaseAggrFunction:
         self._temp_state = None
         self._name = name
         self._timed = False
-        self._old_bucket_value = None
-        self._attributes = {CONF_METHOD: name}
+        self._current_bucket = None
+        self._attributes = {ATTR_METHOD: name}
         if range_:
             self._range = range_
             self._attributes[CONF_RANGE] = range_
             self._current_range = 0
         if cycle:
             self._cycle = cycle
-            self._attributes[CONF_CYCLE] = cycle
+            self._attributes[ATTR_CYCLE] = cycle
 
     @property
     def timed(self):
@@ -112,25 +123,31 @@ class BaseAggrFunction:
             self._current_range += 1
             return False
 
-    def _is_new_time_bucket(self, state):
-        minute = state.get('now').minute
+    def _is_new_time_bucket(self, minute):
+        # minute = state.get('now').minute
         _bucket = int(minute / self._cycle)
-        if _bucket == self._old_bucket_value:
+        if self._current_bucket is None:
+            self._current_bucket = _bucket
             return False
-        else:
-            self._old_bucket_value=_bucket
-
+        if _bucket == self._current_bucket:
+            return False
+        self._current_bucket = _bucket
+        return True
 
     def aggregate(self, state):
         raise NotImplemented
 
+class AggrMinEvery(BaseAggrFunction):
+    def __init__(self,aggregator):
+        BaseAggrFunction.__init__(self,CONFMETHOD_MIN_EVERY,
+                                  cycle=aggregator.get(ATTR_CYCLE))
 
 class AggrMaxEvery(BaseAggrFunction):
     def __init__(self, aggregator):
         BaseAggrFunction.__init__(self, CONF_METHOD_MAX_EVERY,
-                                  cycle=aggregator.get(CONF_CYCLE))
+                                  cycle=aggregator.get(ATTR_CYCLE))
         self._timed = True
-
+        self._last_value = None
 
     def _check_max(self, new_val):
         if self._temp_state is None:
@@ -138,17 +155,32 @@ class AggrMaxEvery(BaseAggrFunction):
         else:
             self._temp_state = max(self._temp_state, new_val)
 
-    def aggregate(self, event):
-        if event.event_type == EVENT_TIME_CHANGED:
-            if self._is_new_time_bucket(event):
-                if self._temp_state is not None:
-                    self._old_bucket_value = self._temp_state
-                    self._temp_state = None
-                return self._old_bucket_value
+    def _aggregate(self, event_type, current_minute, state_value):
+        if event_type == EVENT_TIME_CHANGED:
+            if self._is_new_time_bucket(current_minute):
+                _val = self._temp_state
+                # save the value as the starting point for the next bucket.
+                self._temp_state = self._last_recorded_value
+                return _val
             else:
                 return None
         else:
-            self._check_max(event.data.get(ATTR_NEW_STATE).state)
+            self._last_recorded_value = state_value
+            self._check_max(state_value)
+            return None
+
+    def aggregate(self, event):
+        _temp = event.data.get('now')
+        _current_minute=None
+        _new_state=None
+        if _temp:
+            _current_minute=_temp.minute
+        _temp = event.data.get(ATTR_NEW_STATE)
+        if _temp:
+            _new_state=_temp.state
+        return self._aggregate(event.event_type,
+                               _current_minute,
+                               _new_state)
 
 
 class AggrSkip(BaseAggrFunction):
@@ -202,7 +234,7 @@ class AggrMin(BaseAggrFunction):
 
 
 def get_aggregator(aggregator: dict) -> BaseAggrFunction:
-    _method = aggregator.get(CONF_METHOD)
+    _method = aggregator.get(ATTR_METHOD)
     if _method == CONF_METHOD_SKIP:
         return AggrSkip(aggregator)
     elif _method == CONF_METHOD_MAX:
