@@ -2,51 +2,49 @@
 hass-aggregator:
     - entity_id: <an id>
       aggregator:
-        method: skip
-        range: 10
+        bucket:
+          trigger: state
+          size: 10
     - entity_id: <an id>
       aggregator:
-        method: max
-        range: 4
-    - entity_id: <an id>
-      aggregator:
-        cycle:
-          cycle: time
-          range: 10 #minutes
+        bucket:
+          trigger: time
+          size: 10 #minutes
         methods:
           - max
           - min
           - average
-          cycle: 10 minutes
-    - entity_id: <an id>
-      aggregator:
-        method: cap
-        upper: <upper value to cap.>
-        lower: <lower value to cap.>
+        active:
+          trigger: time
+          after: 5
+          before: 23
 
-average
-max
-maxevery
-min
-minevery
-cap
-sum
 sun # special case with capping and skipping.
 """
-
-CONF_CYCLE = 'cycle'
-CONF_CYCLE_TIME = 'time'
-CONF_CYCLE_RANGE = 'range'
-
 
 import asyncio
 import logging
 
 from homeassistant.const import EVENT_STATE_CHANGED, STATE_UNKNOWN, \
     EVENT_TIME_CHANGED, ATTR_ENTITY_ID
-from homeassistant.core import callback
+from homeassistant.core import callback, split_entity_id
 from homeassistant.helpers.entity import async_generate_entity_id, Entity
 from homeassistant.helpers.entity_component import EntityComponent
+
+CONF_BUCKET = 'bucket'
+CONF_BUCKET_TRIGGER = 'trigger'
+CONF_BUCKET_SIZE = 'size'
+CONF_METHODS = 'methods'
+CONF_METHOD_MAX = 'max'
+CONF_METHOD_MIN = 'min'
+CONF_METHOD_AVG = 'avg'
+CONF_AGGREGATOR = 'aggregator'
+CONF_ACTIVE = 'active'
+CONF_BUCKET_TRIGGER_TIME = 'time'
+CONF_BUCKET_TRIGGER_STATE = 'state'
+
+ATTR_TRIGGER_ATTRIBUTE_CHANGE = 'attribute_change'
+ATTR_TRIGGER_TIME_CHANGE = 'time_change'
 
 DOMAIN = 'hass_aggregator'
 
@@ -55,16 +53,6 @@ ATTR_NEW_STATE = 'new_state'
 ENTITY_ID_FORMAT = DOMAIN + '.{}'
 
 _LOGGER = logging.getLogger(__name__)
-
-ATTR_AGGREGATOR = 'aggregator'
-ATTR_METHOD = 'method'
-CONF_METHOD_EVERY = 'every'
-CONF_METHOD_MAX = 'max'
-CONF_METHOD_MIN = 'min'
-CONF_METHOD_SKIP = 'skip'
-CONF_METHOD_MAX_EVERY = 'maxevery'
-ATTR_CYCLE = 'cycle'
-CONF_RANGE = 'range'
 
 
 @asyncio.coroutine
@@ -75,57 +63,118 @@ def async_setup(hass, config):
                 for aggregator in config[DOMAIN]]
 
     @callback
-    def aggregate(_event):
-        # new_state = _event.data.get('new_state')
+    def aggregate_state(_event):
         for entity in entities:
-            entity.aggregate(_event)
+            entity.aggregate_state(_event)
+
+    @callback
+    def aggregate_time(_event):
+        for entity in entities:
+            entity.aggregate_time(_event)
 
     hass.bus.async_listen(
         EVENT_STATE_CHANGED,
-        aggregate
+        aggregate_state
     )
     hass.bus.async_listen(
         EVENT_TIME_CHANGED,
-        aggregate
+        aggregate_time
     )
     yield from component.async_add_entities(entities)
     return True
 
 
-class BaseAggrFunction:
-    def __init__(self, name, range_=None, cycle=None):
-        self._temp_state = None
-        self._name = name
-        self._timed = False
+class ActiveBase:
+    def __init__(self):
+        self._active = True
+        self_previous_state = True
+
+    @property
+    def is_active(self):
+        return self._active
+
+    def check_active(self, event):
+        """method should check if active and set previous value
+        as the previous state"""
+        return
+
+    @property
+    def has_changed(self):
+        """Check whether previous and current active values are different"""
+        return False
+
+
+class TimeActive(ActiveBase):
+    def __init__(self):
+        ActiveBase.__init__(self)
+
+    def check_active(self, event):
+        if event.event_type == EVENT_TIME_CHANGED:
+            _current_hour = event.data.get('now').hour
+
+
+
+class BucketBase:
+    def __init__(self, aggregator):
+        self._trigger = aggregator.get(CONF_BUCKET_TRIGGER)
+        self._size = aggregator.get(CONF_BUCKET_SIZE)
+        self._values = []
+
+    def _update_value(self, state_event):
+        _val = state_event.data.get(ATTR_NEW_STATE).state
+        self._values.append(_val)
+
+    def get_state_attributes(self):
+        return {CONF_BUCKET_TRIGGER: self._trigger,
+                CONF_BUCKET_SIZE: self._size}
+
+    @property
+    def values(self):
+        return self._values
+
+    def update_bucket(self, state_event, time_event):
+        raise NotImplemented
+
+    def is_new_bucket(self):
+        raise NotImplemented
+
+    def flush(self):
+        self._values = []
+
+
+class AttributeChangeBucket(BucketBase):
+    def __init__(self, aggregator):
+        # Range meaning the amount of attribute values to collect before
+        # taking action.
+        BucketBase.__init__(self, aggregator)
+
+    def update_bucket(self, state_event, time_event):
+        if state_event:
+            self._update_value(state_event)
+
+    def is_new_bucket(self):
+        return len(self._values) >= self._size
+
+
+class TimeChangeBucket(BucketBase):
+    def __init__(self, aggregator):
+        # Range meaning the time range in minutes in which data is to be
+        # collected.
+        BucketBase.__init__(self, aggregator)
         self._current_bucket = None
-        self._attributes = {ATTR_METHOD: name}
-        if range_:
-            self._range = range_
-            self._attributes[CONF_RANGE] = range_
-            self._current_range = 0
-        if cycle:
-            self._cycle = cycle
-            self._attributes[ATTR_CYCLE] = cycle
+        self._current_minute = None
 
-    @property
-    def timed(self):
-        return self._timed
-
-    @property
-    def name(self):
-        return self._name
-
-    def _check_range(self):
-        if self._current_range == self._range:
-            self._current_range = 0
-            return True
+    def update_bucket(self, state_event, time_event):
+        if state_event:
+            self._update_value(state_event)
         else:
-            self._current_range += 1
-            return False
+            self._current_minute = time_event.data.get('now').minute
 
-    def _is_new_time_bucket(self, minute):
-        # minute = state.get('now').minute
-        _bucket = int(minute / self._cycle)
+    def is_new_bucket(self):
+        if self._current_minute is None:
+            _LOGGER.error("no current minute set yet")
+            return False
+        _bucket = int(self._current_minute / self._size)
         if self._current_bucket is None:
             self._current_bucket = _bucket
             return False
@@ -134,147 +183,90 @@ class BaseAggrFunction:
         self._current_bucket = _bucket
         return True
 
-    def aggregate(self, state):
-        raise NotImplemented
 
-class AggrMinEvery(BaseAggrFunction):
-    def __init__(self,aggregator):
-        BaseAggrFunction.__init__(self,CONFMETHOD_MIN_EVERY,
-                                  cycle=aggregator.get(ATTR_CYCLE))
-
-class AggrMaxEvery(BaseAggrFunction):
-    def __init__(self, aggregator):
-        BaseAggrFunction.__init__(self, CONF_METHOD_MAX_EVERY,
-                                  cycle=aggregator.get(ATTR_CYCLE))
-        self._timed = True
-        self._last_value = None
-
-    def _check_max(self, new_val):
-        if self._temp_state is None:
-            self._temp_state = new_val
-        else:
-            self._temp_state = max(self._temp_state, new_val)
-
-    def _aggregate(self, event_type, current_minute, state_value):
-        if event_type == EVENT_TIME_CHANGED:
-            if self._is_new_time_bucket(current_minute):
-                _val = self._temp_state
-                # save the value as the starting point for the next bucket.
-                self._temp_state = self._last_recorded_value
-                return _val
-            else:
-                return None
-        else:
-            self._last_recorded_value = state_value
-            self._check_max(state_value)
-            return None
-
-    def aggregate(self, event):
-        _temp = event.data.get('now')
-        _current_minute=None
-        _new_state=None
-        if _temp:
-            _current_minute=_temp.minute
-        _temp = event.data.get(ATTR_NEW_STATE)
-        if _temp:
-            _new_state=_temp.state
-        return self._aggregate(event.event_type,
-                               _current_minute,
-                               _new_state)
-
-
-class AggrSkip(BaseAggrFunction):
-    def __init__(self, aggregator):
-        BaseAggrFunction.__init__(self, CONF_METHOD_SKIP,
-                                  range_=aggregator.get(CONF_RANGE))
-
-    def aggregate(self, event):
-        if self._check_range():
-            return event.data.get(ATTR_NEW_STATE).state
-        else:
-            return None
-
-
-class AggrMax(BaseAggrFunction):
-    def __init__(self, aggregator):
-        BaseAggrFunction.__init__(self, CONF_METHOD_MAX,
-                                  range_=aggregator.get(CONF_RANGE))
-
-    def _check_max(self, new_val):
-        if self._temp_state is None:
-            self._temp_state = new_val
-        else:
-            self._temp_state = max(self._temp_state, new_val)
-
-    def aggregate(self, event):
-        self._check_max(event.data.get(ATTR_NEW_STATE).state)
-        if self._check_range():
-            return self._temp_state
-        else:
-            return None
-
-
-class AggrMin(BaseAggrFunction):
-    def __init__(self, aggregator):
-        BaseAggrFunction.__init__(self, CONF_METHOD_MIN,
-                                  range_=aggregator.get(CONF_RANGE))
-
-    def _check_min(self, new_val):
-        if self._temp_state is None:
-            self._temp_state = new_val
-        else:
-            self._temp_state = min(self._temp_state, new_val)
-
-    def aggregate(self, event):
-        self._check_min(event.data.get(ATTR_NEW_STATE).state)
-        if self._check_range():
-            return self._temp_state
-        else:
-            return None
-
-
-def get_aggregator(aggregator: dict) -> BaseAggrFunction:
-    _method = aggregator.get(ATTR_METHOD)
-    if _method == CONF_METHOD_SKIP:
-        return AggrSkip(aggregator)
-    elif _method == CONF_METHOD_MAX:
-        return AggrMax(aggregator)
-    elif _method == CONF_METHOD_MIN:
-        return AggrMin(aggregator)
-    elif _method == CONF_METHOD_MAX_EVERY:
-        return AggrMaxEvery(aggregator)
+def get_bucket(aggregator: dict) -> BucketBase:
+    _bucket = aggregator.get(CONF_BUCKET)
+    _trigger = _bucket.get(CONF_BUCKET_TRIGGER)
+    if _trigger == CONF_BUCKET_TRIGGER_STATE:
+        return AttributeChangeBucket(_bucket)
+    elif _trigger == CONF_BUCKET_TRIGGER_TIME:
+        return TimeChangeBucket(_bucket)
     else:
-        _LOGGER.error("undefined aggregator method.")
+        _LOGGER.error("undefined bucket")
+
+
+def get_active_parser(aggregator: dict) -> ActiveBase:
+    _active = aggregator.get(CONF_ACTIVE)
+    return ActiveBase()
+
+
+def aggr_max(values):
+    return max(values)
+
+
+def aggr_min(values):
+    return min(values)
+
+
+def aggr_avg(values):
+    return sum(values) / len(values)
 
 
 class AggregatedEntity(Entity):
     def __init__(self, hass, aggregator):
         self._state = STATE_UNKNOWN
-        self.aggregator = get_aggregator(aggregator.get('aggregator'))
-
+        _aggregator = aggregator.get(CONF_AGGREGATOR)
+        self._active = get_active_parser(_aggregator)
+        self._bucket = get_bucket(_aggregator)
+        self._methods = _aggregator.get(CONF_METHODS)
         self.id_to_aggregate = aggregator.get(ATTR_ENTITY_ID)
-        self.aggregated_id = '{} {}'.format(
-            self.id_to_aggregate.replace('.', ' '),
-            self.aggregator.name)
+        _slug_entity_id = ' '.join(split_entity_id(self.id_to_aggregate))
         self.entity_id = async_generate_entity_id(
             ENTITY_ID_FORMAT,
-            self.aggregated_id,
+            _slug_entity_id,
             hass=hass)
+        self._state_attributes = self._bucket.get_state_attributes()
 
-    def aggregate(self, event):
-        _state = None
+    def aggregate_time(self, time_event):
+        self._bucket.update_bucket(None, time_event)
+        self._aggregate(time_event)
 
-        _entity_id = event.data.get(ATTR_ENTITY_ID)
-        _check_by_id = _entity_id == self.id_to_aggregate
-        if ((self.aggregator.timed and event.event_type == EVENT_TIME_CHANGED)
-            or _check_by_id):
-            _state = self.aggregator.aggregate(event)
-        if _state:
-            self._state = _state
+    def aggregate_state(self, state_event):
+        if state_event.data.get(ATTR_ENTITY_ID) == self.id_to_aggregate:
+            self._bucket.update_bucket(state_event,
+                                       None)
+            self._aggregate(state_event)
+
+    def _aggregate(self, event):
+        self._active.check_active(event)
+        if self._active.is_active:
+            if self._bucket.is_new_bucket():
+                self._process()
+        elif self._active.has_changed:
+            self._process()
+
+    def _process(self):
+        _values = self._bucket.values
+        self._bucket.flush()
+        self._state_attributes['no_of_values'] = len(_values)
+        if len(_values) == 0:
+            # get the state of a value.
+            _state = self.hass.states.get(self.id_to_aggregate)
+            _values.append(_state.state)
+        for _method in self._methods:
+            if _method == CONF_METHOD_AVG:
+                self._state_attributes[CONF_METHOD_AVG] = aggr_avg(_values)
+            elif _method == CONF_METHOD_MAX:
+                self._state_attributes[CONF_METHOD_MAX] = aggr_max(_values)
+            elif _method == CONF_METHOD_MIN:
+                self._state_attributes[CONF_METHOD_MIN] = aggr_min(_values)
+        self._state = _values[-1]
+
+    # process the collected data using the attached methods.
 
     @property
     def state_attributes(self):
-        return self.aggregator._attributes
+        return self._state_attributes
 
     @property
     def state(self):
