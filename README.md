@@ -9,30 +9,26 @@ Put the file into the `custom_components` folder of your config.
  Add a configuration to your `configuration.yaml`: 
 
 ```bash
-yaml
 hass-aggregator:
     - entity_id: <an id>
       aggregator:
-        method: skip
-        range: 10
+        bucket:
+          trigger: state
+          size: 10
     - entity_id: <an id>
       aggregator:
-        method: max
-        range: 4
-    - entity_id: <an id>
-      aggregator:
-        method: cap
-        upper: <upper value to cap.>
-        lower: <lower value to cap.>
+        bucket:
+          trigger: time
+          size: 10 #minutes
+        methods:
+          - max
+          - min
+          - average
+        active:
+          trigger: time
+          after: 5
+          before: 23
 
-average : not done
-max : done
-min : done
-skip: done
-cap : not done
-sum : not done
-cap : not done
-sun : not done # special case with capping and skipping.
 ```
 
 The original `entity_id` will be rewritten as `hass_aggregator_<domain>_<id>_<aggregator_name>`
